@@ -143,8 +143,8 @@ wheels = [
 ]
 
 [[package]]
-name = "cq-team-api"
-version = "0.1.0"
+name = "cq-server"
+version = "0.0.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "bcrypt" },

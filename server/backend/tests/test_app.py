@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from team_api.app import app
+
+from cq_server.app import app
 
 
 @pytest.fixture()
@@ -31,7 +32,7 @@ def _propose_payload(**overrides: Any) -> dict[str, Any]:
 
 def _approve_unit(client: TestClient, unit_id: str) -> None:
     """Approve a unit via the store for testing."""
-    from team_api.app import _get_store
+    from cq_server.app import _get_store
 
     store = _get_store()
     store.set_review_status(unit_id, "approved", "test-reviewer")
@@ -69,9 +70,7 @@ class TestPropose:
         resp = client.post("/propose", json=payload)
         assert resp.status_code == 422
 
-    def test_propose_with_whitespace_only_domains_rejected(
-        self, client: TestClient
-    ) -> None:
+    def test_propose_with_whitespace_only_domains_rejected(self, client: TestClient) -> None:
         payload = _propose_payload(domain=["  ", ""])
         resp = client.post("/propose", json=payload)
         assert resp.status_code == 422
@@ -189,7 +188,7 @@ class TestStats:
         assert body["domains"] == {}
 
     def test_stats_after_inserts(self, client: TestClient) -> None:
-        from team_api.app import _get_store
+        from cq_server.app import _get_store
 
         r1 = client.post("/propose", json=_propose_payload(domain=["api", "auth"]))
         r2 = client.post("/propose", json=_propose_payload(domain=["api", "payments"]))
@@ -209,8 +208,8 @@ class TestReviewLifecycleEndToEnd:
     """End-to-end test covering propose -> review -> query -> stats lifecycle."""
 
     def test_full_review_lifecycle(self, client: TestClient) -> None:
-        from team_api.app import _get_store
-        from team_api.auth import hash_password
+        from cq_server.app import _get_store
+        from cq_server.auth import hash_password
 
         store = _get_store()
         store.create_user("reviewer", hash_password("pass123"))
@@ -228,9 +227,7 @@ class TestReviewLifecycleEndToEnd:
         headers = {"Authorization": f"Bearer {token}"}
 
         # Agent proposes a KU.
-        propose_resp = client.post(
-            "/propose", json=_propose_payload(domain=["e2e-test"])
-        )
+        propose_resp = client.post("/propose", json=_propose_payload(domain=["e2e-test"]))
         assert propose_resp.status_code == 201
         unit_id = propose_resp.json()["id"]
 
