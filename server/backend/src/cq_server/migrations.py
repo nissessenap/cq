@@ -94,30 +94,41 @@ def run_migrations(database_url: str | None = None) -> None:
     redacted = _redact_url(url)
 
     cfg = Config(str(_ALEMBIC_INI))
-    # ConfigParser interpolation caveat: `%` in URLs (e.g. URL-encoded
-    # passwords) would need doubling here. Harmless for SQLite paths;
-    # #309/#311 will revisit when Postgres URLs land at runtime.
-    cfg.set_main_option("sqlalchemy.url", url)
 
+    # Hand Alembic a live connection via ``cfg.attributes`` rather than
+    # going through ``cfg.set_main_option("sqlalchemy.url", url)``. The
+    # latter routes through ConfigParser's interpolation engine, which
+    # raises ``ValueError: invalid interpolation syntax`` eagerly on any
+    # literal ``%`` in the URL — a foot-gun once URL-encoded passwords
+    # land with Postgres in #309/#311, and already triggerable today by
+    # a SQLite filename containing ``%``. ``env.py`` picks up the
+    # connection before it tries to build its own engine.
     engine = create_engine(url)
     try:
-        tables = set(inspect(engine).get_table_names())
+        # ``engine.begin()`` (not ``connect()``) so the alembic_version
+        # row written by stamp/upgrade actually commits at block exit —
+        # this matches the Alembic cookbook recipe for "sharing a
+        # connection with a series of migration commands."
+        with engine.begin() as connection:
+            tables = set(inspect(connection).get_table_names())
+            cfg.attributes["connection"] = connection
+
+            if "alembic_version" not in tables and "knowledge_units" in tables:
+                # Pre-Alembic prod DB: the schema already exists, just
+                # record that we're at baseline so ``upgrade head``
+                # doesn't re-run the CREATE TABLE statements (which
+                # would fail).
+                _logger.info(
+                    "Pre-Alembic database detected at %s; stamping at baseline %s",
+                    redacted,
+                    BASELINE_REVISION,
+                )
+                command.stamp(cfg, BASELINE_REVISION)
+
+            _logger.info("Running Alembic upgrade head against %s", redacted)
+            command.upgrade(cfg, "head")
     finally:
         engine.dispose()
-
-    if "alembic_version" not in tables and "knowledge_units" in tables:
-        # Pre-Alembic prod DB: the schema already exists, just record
-        # that we're at baseline so `upgrade head` doesn't re-run the
-        # CREATE TABLE statements (which would fail).
-        _logger.info(
-            "Pre-Alembic database detected at %s; stamping at baseline %s",
-            redacted,
-            BASELINE_REVISION,
-        )
-        command.stamp(cfg, BASELINE_REVISION)
-
-    _logger.info("Running Alembic upgrade head against %s", redacted)
-    command.upgrade(cfg, "head")
 
 
 def _redact_url(url: str) -> str:

@@ -425,6 +425,73 @@ class TestSqliteParentDirCreation:
         assert not Path("/subdir").exists()
 
 
+class TestPercentInUrlIsConfigParserSafe:
+    """Regression: literal ``%`` in the database URL must not crash startup.
+
+    The original implementation called ``cfg.set_main_option(
+    "sqlalchemy.url", url)``, which routes through ConfigParser's
+    interpolation engine and raises ``ValueError: invalid interpolation
+    syntax`` eagerly on any ``%``. Both call sites (``run_migrations``
+    and ``alembic/env.py``) were affected. The fix bypasses the ini
+    option entirely — the runtime hands a connection in via
+    ``cfg.attributes["connection"]`` and the CLI path builds its own
+    engine from a URL resolved at use-time.
+
+    A ``%`` in a SQLite filename exercises the same code path that a
+    ``%``-encoded Postgres password (e.g. ``p%40ss``) would hit, so we
+    can pin the regression without a real database server.
+    """
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "100%real.db",
+            "p%40ss.db",
+            "weird%%name.db",
+        ],
+    )
+    def test_runtime_path_handles_percent_in_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        url = f"sqlite:///{filename}"
+
+        run_migrations(url)
+
+        db = tmp_path / filename
+        assert db.exists()
+        with _open_ro(db) as conn:
+            assert _alembic_version(conn) == BASELINE_REVISION
+
+    def test_cli_path_handles_percent_in_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drives the CLI branch in ``env.py`` — no connection on the Config.
+
+        Without the fix, ``env.py``'s module-level ``set_main_option(
+        "sqlalchemy.url", resolve_database_url())`` would crash on import
+        before any migration ran.
+        """
+        from alembic import command
+        from alembic.config import Config
+
+        from cq_server.migrations import _ALEMBIC_INI
+
+        monkeypatch.chdir(tmp_path)
+        db = tmp_path / "100%real.db"
+        monkeypatch.setenv("CQ_DATABASE_URL", f"sqlite:///{db}")
+        monkeypatch.delenv("CQ_DB_PATH", raising=False)
+
+        cfg = Config(str(_ALEMBIC_INI))
+        # Deliberately do not set ``cfg.attributes["connection"]`` —
+        # this is the path ``alembic upgrade head`` from the shell takes.
+        command.upgrade(cfg, "head")
+
+        assert db.exists()
+        with _open_ro(db) as conn:
+            assert _alembic_version(conn) == BASELINE_REVISION
+
+
 class TestDefaultDatabaseUrlResolution:
     """``run_migrations()`` with no arg must honour ``resolve_database_url``.
 
