@@ -44,14 +44,18 @@ lives in `cq_server.db_url.resolve_database_url`. Precedence:
    the existing env var).
 3. Default — `sqlite:////data/cq.db`.
 
-The `SqliteStore` constructor still calls the legacy
-`_ensure_schema()` for safety during the rollout window. Both the
-migration and the legacy DDL are idempotent, so running them in
-sequence is harmless. The legacy path will be removed in
-[issue #310][issue-310] once this PR has deployed everywhere — until
-then, any schema change must be added as a new Alembic migration
-*and* mirrored in `cq_server/tables.py` / `cq_server/store/_sqlite.py`
-to keep the two paths in sync.
+Schema is owned exclusively by Alembic. `SqliteStore` no longer creates
+or alters tables — any schema change must land as a new Alembic
+migration in `alembic/versions/`. There is no parallel `tables.py` /
+`SqliteStore` DDL to keep in sync.
+
+**Rollback.** If a new migration causes a bad deploy, redeploy the
+previous server image. The previous version sees an `alembic_version`
+ahead of its head and refuses to start (Alembic's normal behaviour),
+which is the desired safeguard against silently downgrading data. To
+recover, either re-deploy the version that wrote the newer
+`alembic_version`, or hand-write a downgrade migration before
+redeploying the older image.
 
 To run Alembic commands against a local dev database (the path is
 resolved relative to wherever `alembic` is invoked from — here,
@@ -65,5 +69,3 @@ CQ_DB_PATH=./dev.db uv run alembic upgrade head
 
 Full environment-variable documentation will land alongside the
 `CQ_DATABASE_URL` runtime wiring in a later phase-1 child issue.
-
-[issue-310]: https://github.com/mozilla-ai/cq/issues/310
