@@ -8,11 +8,15 @@ module skips when Docker is unavailable.
 """
 
 import threading
+import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 from cq.models import Evidence, Insight, KnowledgeUnit, create_knowledge_unit
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 from cq_server.migrations import _MIGRATION_LOCK_KEY, run_migrations
 from cq_server.repositories._queries import SELECT_PROPOSED_DAILY
@@ -167,3 +171,110 @@ def test_pg_migration_serializes_on_advisory_lock(pg_url: str) -> None:
     finally:
         conn.close()
         holder.dispose()
+
+
+def test_pg_migration_runs_ddl_once_under_concurrency(pg_url: str) -> None:
+    """Two concurrent fresh-database startups serialize instead of racing on DDL.
+
+    The blocking test above proves the lock is *taken*; this proves what
+    the lock is *for*: on a brand-new database, two pods starting together
+    must not both run the baseline ``CREATE TABLE`` / ``stamp``. Those
+    DDL-emitting branches never fire against the session ``pg_url`` (it is
+    already migrated), so they only get coverage here.
+
+    Deterministic, no correctness-gating sleeps: an external session holds
+    the migration lock, we start two ``run_migrations`` threads, then poll
+    ``pg_locks`` until *both* are provably queued on that exact advisory
+    lock (the wall clock is only a failure deadline). Only then do we
+    release, so both are past ``create_engine`` and genuinely blocked on
+    the lock — not merely slow to start — and the migration serializes
+    them. Without the lock the threads never queue (poll never sees two
+    waiters) and race into duplicate DDL, so this fails in both directions.
+
+    Runs against a throwaway database on the same server; skips cleanly if
+    the test role can't ``CREATE DATABASE``.
+    """
+    admin_url = make_url(pg_url).set(database="postgres")
+    dbname = f"cq_mig_race_{uuid.uuid4().hex}"
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    created = False
+    try:
+        try:
+            with admin.connect() as c:
+                c.execute(text(f'CREATE DATABASE "{dbname}"'))
+            created = True
+        except Exception as exc:  # noqa: BLE001 — provisioning, not the thing under test
+            pytest.skip(f"cannot CREATE DATABASE for concurrency test: {exc}")
+
+        # render_as_string(hide_password=False): plain str() masks the
+        # password as "***", which would then fail authentication.
+        fresh_url = make_url(pg_url).set(database=dbname).render_as_string(hide_password=False)
+
+        # Hold the migration lock so both threads must queue behind it.
+        holder_engine = create_engine(fresh_url)
+        holder = holder_engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                run_migrations(fresh_url)
+            except BaseException as exc:  # noqa: BLE001 — surfaced to the test below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_run, daemon=True) for _ in range(2)]
+        try:
+            holder.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _MIGRATION_LOCK_KEY})
+            for t in threads:
+                t.start()
+
+            def _waiters() -> int:
+                # Sessions blocked acquiring an advisory lock on our fresh DB
+                # show up as ungranted 'advisory' rows in pg_locks.
+                with admin.connect() as c:
+                    return c.execute(
+                        text(
+                            "SELECT count(*) FROM pg_locks l "
+                            "JOIN pg_database d ON d.oid = l.database "
+                            "WHERE d.datname = :db AND l.locktype = 'advisory' AND NOT l.granted"
+                        ),
+                        {"db": dbname},
+                    ).scalar_one()
+
+            deadline = time.monotonic() + 5.0
+            while _waiters() < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert _waiters() >= 2, "both run_migrations did not queue on the advisory lock"
+
+            # Release; the two runs now proceed one at a time.
+            holder.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _MIGRATION_LOCK_KEY})
+
+            for t in threads:
+                t.join(timeout=15.0)
+            assert not any(t.is_alive() for t in threads), "run_migrations did not finish"
+            assert not errors, f"concurrent migrations raced into duplicate DDL: {errors!r}"
+
+            # Exactly one built the schema; the other found it already done.
+            check = create_engine(fresh_url)
+            try:
+                with check.connect() as c:
+                    got = c.execute(text("SELECT to_regclass('public.knowledge_units')")).scalar()
+                assert got is not None, "schema was not created"
+            finally:
+                check.dispose()
+        finally:
+            holder.close()
+            holder_engine.dispose()
+    finally:
+        if created:
+            with admin.connect() as c:
+                # Drop needs no other sessions on the DB; migration engines are
+                # disposed by now, but terminate any stragglers to be safe.
+                c.execute(
+                    text(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = :d AND pid <> pg_backend_pid()"
+                    ),
+                    {"d": dbname},
+                )
+                c.execute(text(f'DROP DATABASE IF EXISTS "{dbname}"'))
+        admin.dispose()

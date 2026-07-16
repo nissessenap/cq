@@ -127,6 +127,15 @@ def run_migrations(database_url: str | None = None) -> None:
         # row written by stamp/upgrade actually commits at block exit —
         # this matches the Alembic cookbook recipe for "sharing a
         # connection with a series of migration commands."
+        #
+        # Constraint of sharing one already-open transaction across the
+        # whole critical section (which is what lets the advisory lock
+        # below span all the DDL): migrations run in Alembic's "external
+        # transaction" mode, so ``op.get_context().autocommit_block()`` is
+        # unavailable. A future migration needing non-transactional DDL
+        # (``CREATE INDEX CONCURRENTLY``, ``ALTER TYPE ... ADD VALUE``)
+        # will raise ``AssertionError`` from Alembic here — it would need
+        # its own connection run outside this lock.
         with engine.begin() as connection:
             # Serialize concurrent replica startups on PostgreSQL. Held
             # for the whole transaction (inspect + stamp + upgrade) and

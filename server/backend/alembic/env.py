@@ -91,6 +91,11 @@ def run_migrations_online() -> None:
             context.run_migrations()
         return
 
+    # NOTE: this CLI path does NOT take the #313 migration advisory lock —
+    # that lock lives in ``cq_server.migrations.run_migrations``, the
+    # startup entry point. Running ``alembic upgrade head`` by hand against
+    # a live multi-pod deployment races unprotected; prefer run_migrations
+    # (or ensure a single writer) for online upgrades.
     engine = create_engine(_resolve_url(), poolclass=pool.NullPool)
     try:
         with engine.connect() as conn:
