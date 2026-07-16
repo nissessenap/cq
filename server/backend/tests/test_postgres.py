@@ -130,57 +130,13 @@ async def test_pg_daily_counts_datestyle_independent(pg_repos: _RepoBundle) -> N
     assert today in {row[0] for row in rows}
 
 
-def test_pg_migration_serializes_on_advisory_lock(pg_url: str) -> None:
-    """Concurrent pod startups must take turns on the migration.
-
-    Simulate "pod A is mid-migration" by holding the migration advisory
-    lock on an external session, then assert a second ``run_migrations``
-    blocks on that same lock instead of racing into the schema work, and
-    completes cleanly once we release it. Without the lock the migration
-    would run DDL immediately even while another pod holds the lock.
-    """
-    holder = create_engine(pg_url)
-    # AUTOCOMMIT so the session-level lock is held by the connection alone,
-    # with no lingering transaction — session advisory locks outlive the
-    # statement and are released only by unlock (or the session closing).
-    conn = holder.connect().execution_options(isolation_level="AUTOCOMMIT")
-    try:
-        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _MIGRATION_LOCK_KEY})
-
-        done = threading.Event()
-        error: list[BaseException] = []
-
-        def _run() -> None:
-            try:
-                run_migrations(pg_url)
-            except BaseException as exc:  # noqa: BLE001 — surfaced to the test below
-                error.append(exc)
-            finally:
-                done.set()
-
-        threading.Thread(target=_run, daemon=True).start()
-
-        # While we hold the lock, run_migrations must be stuck acquiring it.
-        assert not done.wait(timeout=2.0), "run_migrations did not block on the advisory lock"
-
-        # Release; the migration should now proceed and finish cleanly.
-        conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _MIGRATION_LOCK_KEY})
-
-        assert done.wait(timeout=10.0), "run_migrations did not finish after lock release"
-        assert not error, f"run_migrations raised after acquiring the lock: {error[0]!r}"
-    finally:
-        conn.close()
-        holder.dispose()
-
-
 def test_pg_migration_runs_ddl_once_under_concurrency(pg_url: str) -> None:
     """Two concurrent fresh-database startups serialize instead of racing on DDL.
 
-    The blocking test above proves the lock is *taken*; this proves what
-    the lock is *for*: on a brand-new database, two pods starting together
-    must not both run the baseline ``CREATE TABLE`` / ``stamp``. Those
-    DDL-emitting branches never fire against the session ``pg_url`` (it is
-    already migrated), so they only get coverage here.
+    On a brand-new database, two pods starting together must not both run
+    the baseline ``CREATE TABLE`` / ``stamp``. Those DDL-emitting branches
+    never fire against the already-migrated session ``pg_url``, so they
+    only get coverage here.
 
     Deterministic, no correctness-gating sleeps: an external session holds
     the migration lock, we start two ``run_migrations`` threads, then poll
@@ -267,14 +223,5 @@ def test_pg_migration_runs_ddl_once_under_concurrency(pg_url: str) -> None:
     finally:
         if created:
             with admin.connect() as c:
-                # Drop needs no other sessions on the DB; migration engines are
-                # disposed by now, but terminate any stragglers to be safe.
-                c.execute(
-                    text(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                        "WHERE datname = :d AND pid <> pg_backend_pid()"
-                    ),
-                    {"d": dbname},
-                )
                 c.execute(text(f'DROP DATABASE IF EXISTS "{dbname}"'))
         admin.dispose()
