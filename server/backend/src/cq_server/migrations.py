@@ -23,7 +23,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 
 from .core.config import database_url_from_env
@@ -33,6 +33,16 @@ __all__ = ["BASELINE_REVISION", "run_migrations"]
 _logger = logging.getLogger(__name__)
 
 BASELINE_REVISION = "0001"
+
+# Well-known key for the PostgreSQL advisory lock that serializes
+# migrations across replicas (#313). Every cq pod must use the *same*
+# fixed value or they'd grab different locks and not wait for each other,
+# so it is a hardcoded literal that must never change between releases.
+# Advisory locks are global to the whole Postgres server; deriving the
+# key from "cqmig" (ASCII) makes an accidental clash with another app
+# sharing the database vanishingly unlikely, and makes it recognisable
+# in ``pg_locks``. Fits a signed 64-bit bigint.
+_MIGRATION_LOCK_KEY = 0x6371_6D6967  # "cqmig"
 
 
 def _find_alembic_ini() -> Path:
@@ -83,11 +93,12 @@ def _ensure_sqlite_parent_dir(url: str) -> None:
 def run_migrations(database_url: str | None = None) -> None:
     """Bring the configured database to head, stamping legacy DBs first.
 
-    Assumes a single caller per database — concurrent invocations across
-    replicas can race on the table-presence check and on ``upgrade``
-    itself. Safe for the current single-instance SQLite deployment;
-    #313 will revisit (via ``pg_advisory_lock``) when Postgres +
-    multi-replica land.
+    On PostgreSQL the whole critical section (table-presence check,
+    stamp, upgrade) runs while holding a transaction-scoped advisory
+    lock, so concurrent startups across replicas take turns instead of
+    racing on the schema — only one pod does the DDL, the rest wait and
+    then find the work already done. SQLite needs no lock: a single file
+    with one writer is already serialized.
 
     Args:
         database_url: SQLAlchemy URL to migrate. Defaults to the value
@@ -116,7 +127,27 @@ def run_migrations(database_url: str | None = None) -> None:
         # row written by stamp/upgrade actually commits at block exit —
         # this matches the Alembic cookbook recipe for "sharing a
         # connection with a series of migration commands."
+        #
+        # Constraint of sharing one already-open transaction across the
+        # whole critical section (which is what lets the advisory lock
+        # below span all the DDL): migrations run in Alembic's "external
+        # transaction" mode, so ``op.get_context().autocommit_block()`` is
+        # unavailable. A future migration needing non-transactional DDL
+        # (``CREATE INDEX CONCURRENTLY``, ``ALTER TYPE ... ADD VALUE``)
+        # will raise ``AssertionError`` from Alembic here — it would need
+        # its own connection run outside this lock.
         with engine.begin() as connection:
+            # Serialize concurrent replica startups on PostgreSQL. Held
+            # for the whole transaction (inspect + stamp + upgrade) and
+            # auto-released on commit/rollback/crash — a pod dying
+            # mid-migration can't wedge every other pod's startup, which
+            # a session-scoped lock (``pg_advisory_lock``) would risk.
+            if engine.dialect.name == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": _MIGRATION_LOCK_KEY},
+                )
+
             tables = set(inspect(connection).get_table_names())
             cfg.attributes["connection"] = connection
 
